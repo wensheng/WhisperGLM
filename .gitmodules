@@ -1,0 +1,9 @@
+[submodule "ChatGLM-6B"]
+	path = ChatGLM-6B
+	url = https://github.com/THUDM/ChatGLM-6B.git
+[submodule "yt-dlp"]
+	path = yt-dlp
+	url = https://github.com/yt-dlp/yt-dlp.git
+[submodule "whisper"]
+	path = whisper
+	url = https://github.com/openai/whisper.git
