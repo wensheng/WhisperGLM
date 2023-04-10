@@ -2,6 +2,8 @@
 
 This is a GUI interface for OpenAI Whisper and GhatGLM running locally.
 
+This program can only run on Windows for now.
+
 With Whisper, it can listen to system audio and transribe speech to text.  It can also download youtube video and transcribe it to text.
 
 Combined with ChatGLM, it can summerize the text, or answer the question in transcribed text, as well as chat with ChatGLM directly.
@@ -34,7 +36,7 @@ Download ChatGLM-6B model from Huggingface (you need to have [git-lfs](https://g
 
 If you don't have git-lfs, you can check out without large file:
 
-    GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/THUDM/chatglm-6b
+    GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/THUDM/chatglm-6b-int4
 
 Then go to: [here](https://huggingface.co/THUDM/chatglm-6b-int4/tree/main) and download `pytorch_model.bin` directly.
 
