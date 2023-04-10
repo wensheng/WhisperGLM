@@ -9,12 +9,14 @@ import ffmpeg
 import pythoncom
 import pyaudio
 import numpy as np
+from transformers import AutoTokenizer, AutoModel
 from PySide6.QtCore import (
-    QObject, QRunnable, QThreadPool, Signal, Slot,
+    QEvent, QObject, QRunnable, Qt, QThreadPool, Signal, Slot,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QComboBox,
     QDialog,
     QLabel,
     QLineEdit,
@@ -37,6 +39,18 @@ import whisper  # noqa: E402
 FRAMES_PER_BUFFER = 1024
 CAPTURE_WINDOW = 20   # every 20 seconds, process captured audio
 WIN_INIT_SIZE = (720, 1080)
+MAX_LENGTH = 2048
+TOP_P = 0.7
+TEMPERATURE = 0.9
+
+try:
+    model_path = os.path.join('data', 'chatglm-6b-int4')
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_path, trust_remote_code=True).half().cuda()
+    model = model.eval()
+except Exception as e:
+    print("Error loading ChatGLM model", e)
+    model = None
 
 
 class WorkerSignals(QObject):
@@ -185,6 +199,30 @@ class SegmentWorker(QRunnable):
             out, _ = ffmpeg.run(audio_output, capture_stdout=True, capture_stderr=True)
             self.buffer.put(out)
             ss += 25 - 0.2
+            
+
+class ChatWorker(QRunnable):
+    def __init__(self, buffer, state):
+        super().__init__()
+        self.buffer = buffer
+        self.state = state
+        self.signals = WorkerSignals()
+
+    def run(self):
+        while True:
+            try:
+                data = self.buffer.get(block=True, timeout=1)
+                print("got buffer")
+                audio = load_audio(data, sr=16000)
+                audio = whisper.pad_or_trim(audio)
+                mel = whisper.log_mel_spectrogram(audio).to(self.model.device)
+                _, probs = self.model.detect_language(mel)
+                options = whisper.DecodingOptions()
+                result = whisper.decode(self.model, mel, options)
+                print(result.text)
+                self.text_box.append(result.text)
+            except queue.Empty:
+                pass
 
 
 class MyDialog(QDialog):
@@ -196,7 +234,9 @@ class MyDialog(QDialog):
         self.buffer = queue.Queue()
         self.state = {'listening': False,
                       'transcribing': False,
-                      'downloading': False}
+                      'downloading': False,
+                      'chatting': False}
+        self.history = []
 
         layout = QVBoxLayout()
 
@@ -235,11 +275,17 @@ class MyDialog(QDialog):
         self.stop_button.pressed.connect(self.stop_listening)
         btn_layout = QHBoxLayout()
         spacer1 = QSpacerItem(40, 20, QSizePolicy.Expanding, QSizePolicy.Minimum)
+        combo_box = QComboBox()
+        combo_box.addItems(["English", "Spanish", "French", "German", "Italian", "Portuguese", "Russian", "Chinese"])
+        btn_layout.addWidget(combo_box)
         btn_layout.addItem(spacer1)
         btn_layout.addWidget(self.start_listen_button)
         btn_layout.addWidget(self.start_youtube_button)
         btn_layout.addWidget(self.stop_button)
         btn_layout.addItem(spacer1)
+        clr_button = QPushButton("Clear")
+        clr_button.pressed.connect(self.clear_text)
+        btn_layout.addWidget(clr_button)
         layout.addLayout(btn_layout)
         # button_group2 = QButtonGroup()
         # button_group2.addButton(self.start_youtube_button)
@@ -257,6 +303,9 @@ class MyDialog(QDialog):
         layout.addWidget(self.text_box)
 
         btn_layout2 = QHBoxLayout()
+        chat_button = QPushButton("Chat")
+        chat_button.pressed.connect(self.start_chat)
+        btn_layout2.addWidget(chat_button)
         btn_layout2.addItem(spacer1)
         summary_button = QPushButton("Summarize")
         summary_button.pressed.connect(self.summarize)
@@ -267,9 +316,16 @@ class MyDialog(QDialog):
         self.summary_box = QTextEdit()
         self.summary_box.setMaximumHeight(300)
         self.summary_box.setFont(font)
+        self.summary_box.setVisible(False)
+        layout.addWidget(self.summary_box)
+        
+        self.chat_box = QTextEdit()
+        self.chat_box.setMaximumHeight(60)
+        self.chat_box.setFont(font)
+        self.chat_box.installEventFilter(self)
+        layout.addWidget(self.chat_box)
 
         # Create the layout for the dialog
-        layout.addWidget(self.summary_box)
 
         status_title_label = QLabel("Status")
         self.status_label = QLabel("")
@@ -282,6 +338,20 @@ class MyDialog(QDialog):
         self.setLayout(layout)
         self.resize(WIN_INIT_SIZE[0], WIN_INIT_SIZE[1])
         # self.threads = {}
+
+    def eventFilter(self, obj, event):
+        if obj is self.chat_box and event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_Return and self.chat_box.hasFocus():
+                print("enter pressed")
+                self.send_chat(self.chat_box.toPlainText())
+                self.text_box.append(f'Me: {self.chat_box.toPlainText()}\n')
+                self.chat_box.setText('')
+                return True
+        return False
+    
+    @Slot()
+    def clear_text(self):
+        self.text_box.setText('')
 
     @Slot()
     def on_listen_button_toggle(self, is_listen):
@@ -331,6 +401,44 @@ class MyDialog(QDialog):
         self.threadpool.start(self.listen_worker)
         self.transcribe_worker = TranscribeWorker(self.buffer, self.text_box, self.state)
         self.threadpool.start(self.transcribe_worker)
+
+    @Slot()
+    def start_chat(self):
+        worker = Worker(self.yt_download)
+        # worker = DownloadWorker(self.url_edit.text(), self.state)
+        worker.signals.finished.connect(self.start_transcribe_yt)
+        self.threadpool.start(worker)
+        self.status_label.setText("Start Chatting with GLM...")
+        
+        self.state['chatting'] = True
+        self.chat_worker = ChatWorker(self.buffer, self.state)
+        self.threadpool.start(self.listen_worker)
+        
+    @Slot()
+    def chat_with_glm(self):
+        global tokenizer, model
+        response, history = model.chat(
+            tokenizer, prompt, history=history,
+            max_length=MAX_LENGTH, top_p=TOP_P,
+            temperature=TEMPERATURE)
+        
+    def send_chat(self, prompt):
+        worker = Worker(self.process_chat, prompt, self.history)
+        worker.signals.result.connect(self.handle_chat_res)
+        self.threadpool.start(worker)
+        
+    @Slot()
+    def handle_chat_res(self, res):
+        self.history = res['history']
+        self.text_box.append(f'ChatGLM: {res["response"]}\n')
+
+    def process_chat(self, prompt, history):
+        global tokenizer, model
+        response, history = model.chat(
+            tokenizer, prompt, history=history,
+            max_length=MAX_LENGTH, top_p=TOP_P,
+            temperature=TEMPERATURE)
+        return {'response': response, 'history': self.history}
 
     @Slot()
     def summarize(self):
