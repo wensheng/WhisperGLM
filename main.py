@@ -3,7 +3,9 @@ import sys
 import traceback
 import wave
 import queue
+import argparse
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
 
 import ffmpeg
 import pythoncom
@@ -42,35 +44,61 @@ WIN_INIT_SIZE = (720, 1080)
 MAX_LENGTH = 2048
 TOP_P = 0.7
 TEMPERATURE = 0.9
+DL_AUDIO_FILE = os.path.join('data', 'temp.m4a')
 
-try:
-    model_path = os.path.join('data', 'chatglm-6b-int4')
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_path, trust_remote_code=True).half().cuda()
-    model = model.eval()
-except Exception as e:
-    print("Error loading ChatGLM model", e)
-    model = None
+model, tokenizer = None, None
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--noglm', type=bool, default=False, help='will not load ChatGLM model')
+
+
+class TaskManager(QObject):
+    """
+    Not Used
+    """
+    finished = Signal(object)
+
+    def __init__(self, parent=None, max_workers=None):
+        super().__init__(parent)
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    @property
+    def executor(self):
+        return self._executor
+
+    def submit(self, fn, *args, **kwargs):
+        future = self.executor.submit(fn, *args, **kwargs)
+        future.add_done_callback(self._internal_done_callback)
+
+    def _internal_done_callback(self, future):
+        data = future.result()
+        self.finished.emit(data)
+ 
 
 class WorkerSignals(QObject):
     '''
     Defines the signals available from a running worker thread.
     '''
-    finished = Signal()
+    finished = Signal(str)
     error = Signal(tuple)
     result = Signal(object)
+    progress = Signal(int)
 
 
 class Worker(QRunnable):
     def __init__(self, fn, *args, **kwargs):
-        super(Worker, self).__init__()
+        super().__init__()
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
+        if self.kwargs.get('finished'):
+            self.finished = self.kwargs.get('finished')
+            del self.kwargs['finished']
+        else:
+            self.finished = ''
+        assert isinstance(self.finished, str)
         self.signals = WorkerSignals()
 
-    @Slot()
     def run(self):
         try:
             result = self.fn(*self.args, **self.kwargs)
@@ -79,23 +107,10 @@ class Worker(QRunnable):
             exctype, value = sys.exc_info()[:2]
             self.signals.error.emit((exctype, value, traceback.format_exc()))
         else:
-            self.signals.result.emit(result)  # Return the result of the processing
+            self.signals.result.emit(result)
         finally:
-            self.signals.finished.emit()  # Done
-
-
-class DownloadWorker(QRunnable):
-    def __init__(self, url, state):
-        super().__init__()
-        self.url = url
-        self.state = state
-        self.signals = WorkerSignals()
-
-    def run(self):
-        print("downloading", self.url)
-        yt_dlp.main(argv=[self.url, '--no-update', '--force-overwrites',
-                          '-q', '-f', '139', '-o', 'temp.m4a'])
-        self.signals.finished.emit()  # Done
+            print("worker finished")
+            self.signals.finished.emit(self.finished)
 
 
 class ListeningWorker(QRunnable):
@@ -187,13 +202,17 @@ class SegmentWorker(QRunnable):
         super().__init__()
         self.buffer = buffer
         self.state = state
-        self.signals = WorkerSignals()
 
     def run(self):
-        duration = get_duration('temp.m4a')
+        duration = get_duration(DL_AUDIO_FILE)
+        try:
+            duration = float(duration)
+        except ValueError:
+            return
+        print("duration", duration)
         ss = 0
         while ss < duration:
-            audio_input = ffmpeg.input('temp.m4a').audio
+            audio_input = ffmpeg.input(DL_AUDIO_FILE).audio
             audio_cut = audio_input.filter('atrim', start=ss, duration=25)
             audio_output = ffmpeg.output(audio_cut, 'pipe:', format='s16le', acodec='pcm_s16le', ac=1, ar=SAMPLE_RATE)
             out, _ = ffmpeg.run(audio_output, capture_stdout=True, capture_stderr=True)
@@ -228,8 +247,8 @@ class ChatWorker(QRunnable):
 class MyDialog(QDialog):
     def __init__(self):
         super().__init__()
-        self.threadpool = QThreadPool()
         self.listen_worker = None
+        self.segment_worker = None
         self.transcribe_worker = None
         self.buffer = queue.Queue()
         self.state = {'listening': False,
@@ -304,7 +323,7 @@ class MyDialog(QDialog):
 
         btn_layout2 = QHBoxLayout()
         chat_button = QPushButton("Chat")
-        chat_button.pressed.connect(self.start_chat)
+        #chat_button.pressed.connect(self.start_chat)
         btn_layout2.addWidget(chat_button)
         btn_layout2.addItem(spacer1)
         summary_button = QPushButton("Summarize")
@@ -338,6 +357,8 @@ class MyDialog(QDialog):
         self.setLayout(layout)
         self.resize(WIN_INIT_SIZE[0], WIN_INIT_SIZE[1])
         # self.threads = {}
+        self.threadpool = QThreadPool()
+        print("Pool created with maximum %d threads" % self.threadpool.maxThreadCount())
 
     def eventFilter(self, obj, event):
         if obj is self.chat_box and event.type() == QEvent.KeyPress:
@@ -355,7 +376,6 @@ class MyDialog(QDialog):
 
     @Slot()
     def on_listen_button_toggle(self, is_listen):
-        print("radio button clicked")
         if is_listen:
             self.url_edit.setEnabled(False)
             self.start_youtube_button.setVisible(False)
@@ -367,27 +387,29 @@ class MyDialog(QDialog):
             self.start_listen_button.setVisible(False)
             self.stop_button.setVisible(False)
 
-    @Slot()
     def start_yt_download(self):
-        worker = Worker(self.yt_download)
-        # worker = DownloadWorker(self.url_edit.text(), self.state)
+        self.status_label.setText("Downloading youtube audio...")
+        worker = Worker(self.yt_download, self.url_edit.text(),
+                        finished='Download finished!')
         worker.signals.finished.connect(self.start_transcribe_yt)
         self.threadpool.start(worker)
-        self.status_label.setText("Downloading youtube audio...")
 
-    def yt_download(self):
-        url = self.url_edit.text()
-        yt_dlp.main(argv=[url, '--no-update', '--force-overwrites',
-                          '-q', '-f', '139', '-o', 'temp.m4a']),
-
+    def yt_download(self, url):
+        """
+        yt_dlp.main(argv) is doing some weird stuff and can not be used
+        """
+        yt_dlp._real_main(argv=[url, '--no-update', '--force-overwrites',
+                          '-q', '-f', '139', '-o', DL_AUDIO_FILE]),
+        
     @Slot()
     def start_transcribe_yt(self):
         print("Starting transcribe YT")
-        self.state['downloading'] = True
+        # self.state['downloading'] = True
         self.segment_worker = SegmentWorker(self.buffer, self.state)
         self.threadpool.start(self.segment_worker)
-        self.transcribe_worker = TranscribeWorker(self.buffer, self.text_box, self.state, noload=True)
-        self.threadpool.start(self.transcribe_worker)
+        if not self.transcribe_worker:
+            self.transcribe_worker = TranscribeWorker(self.buffer, self.text_box, self.state, noload=True)
+            self.threadpool.start(self.transcribe_worker)
         self.status_label.setText("Started transcription!")
 
     @Slot()
@@ -402,26 +424,6 @@ class MyDialog(QDialog):
         self.transcribe_worker = TranscribeWorker(self.buffer, self.text_box, self.state)
         self.threadpool.start(self.transcribe_worker)
 
-    @Slot()
-    def start_chat(self):
-        worker = Worker(self.yt_download)
-        # worker = DownloadWorker(self.url_edit.text(), self.state)
-        worker.signals.finished.connect(self.start_transcribe_yt)
-        self.threadpool.start(worker)
-        self.status_label.setText("Start Chatting with GLM...")
-        
-        self.state['chatting'] = True
-        self.chat_worker = ChatWorker(self.buffer, self.state)
-        self.threadpool.start(self.listen_worker)
-        
-    @Slot()
-    def chat_with_glm(self):
-        global tokenizer, model
-        response, history = model.chat(
-            tokenizer, prompt, history=history,
-            max_length=MAX_LENGTH, top_p=TOP_P,
-            temperature=TEMPERATURE)
-        
     def send_chat(self, prompt):
         worker = Worker(self.process_chat, prompt, self.history)
         worker.signals.result.connect(self.handle_chat_res)
@@ -434,6 +436,8 @@ class MyDialog(QDialog):
 
     def process_chat(self, prompt, history):
         global tokenizer, model
+        if not model:
+            return {'response': 'Model not loaded', 'history': history}
         response, history = model.chat(
             tokenizer, prompt, history=history,
             max_length=MAX_LENGTH, top_p=TOP_P,
@@ -450,6 +454,17 @@ class MyDialog(QDialog):
 
 
 if __name__ == '__main__':
+    args = parser.parse_args()
+    if not args.noglm:
+        try:
+            model_path = os.path.join('data', 'chatglm-6b-int4')
+            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            model = AutoModel.from_pretrained(model_path, trust_remote_code=True).half().cuda()
+            model = model.eval()
+        except Exception as e:
+            print("Error loading ChatGLM model", e)
+    else:
+        print("Will not load ChatGLM model")
     app = QApplication(sys.argv)
     dialog = MyDialog()
     dialog.exec()
