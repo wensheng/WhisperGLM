@@ -4,6 +4,7 @@ import traceback
 import wave
 import queue
 import argparse
+import threading
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 
@@ -39,7 +40,7 @@ import yt_dlp  # noqa: E402
 import whisper  # noqa: E402
 
 FRAMES_PER_BUFFER = 1024
-CAPTURE_WINDOW = 20   # every 20 seconds, process captured audio
+CAPTURE_WINDOW = 15   # every 15 seconds, process captured audio
 WIN_INIT_SIZE = (720, 1080)
 MAX_LENGTH = 2048
 TOP_P = 0.7
@@ -52,34 +53,11 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--noglm', type=bool, default=False, help='will not load ChatGLM model')
 
 
-class TaskManager(QObject):
-    """
-    Not Used
-    """
-    finished = Signal(object)
-
-    def __init__(self, parent=None, max_workers=None):
-        super().__init__(parent)
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
-
-    @property
-    def executor(self):
-        return self._executor
-
-    def submit(self, fn, *args, **kwargs):
-        future = self.executor.submit(fn, *args, **kwargs)
-        future.add_done_callback(self._internal_done_callback)
-
-    def _internal_done_callback(self, future):
-        data = future.result()
-        self.finished.emit(data)
- 
-
 class WorkerSignals(QObject):
     '''
     Defines the signals available from a running worker thread.
     '''
-    finished = Signal(str)
+    finished = Signal()
     error = Signal(tuple)
     result = Signal(object)
     progress = Signal(int)
@@ -91,12 +69,6 @@ class Worker(QRunnable):
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
-        if self.kwargs.get('finished'):
-            self.finished = self.kwargs.get('finished')
-            del self.kwargs['finished']
-        else:
-            self.finished = ''
-        assert isinstance(self.finished, str)
         self.signals = WorkerSignals()
 
     def run(self):
@@ -110,15 +82,15 @@ class Worker(QRunnable):
             self.signals.result.emit(result)
         finally:
             print("worker finished")
-            self.signals.finished.emit(self.finished)
+            self.signals.finished.emit()
 
 
 class ListeningWorker(QRunnable):
     # data_ready = Signal(bytes)
-    def __init__(self, buffer, state):
+    def __init__(self, buffer, stop_event):
         super().__init__()
         self.buffer = buffer
-        self.state = state
+        self.stop_event = stop_event
         print("listening worker initialized")
         self.signals = WorkerSignals()
 
@@ -129,7 +101,7 @@ class ListeningWorker(QRunnable):
         p = pyaudio.PyAudio()
 
         while True:
-            if self.state['listening'] is False:
+            if self.stop_event.is_set():
                 break
             buffer = BytesIO()
             # Open a wave buffer for writing
@@ -162,23 +134,27 @@ class ListeningWorker(QRunnable):
         p.terminate()
         # Uninitialize the Core Audio API
         pythoncom.CoUninitialize()
+        self.signals.finished.emit()
 
 
 class TranscribeWorker(QRunnable):
     processed = Signal(str)
 
-    def __init__(self, buffer, text_box, state, noload=False):
+    def __init__(self, buffer, text_box, stop_event, noload=False):
         super().__init__()
         print("transcribe worker initialized")
         self.buffer = buffer
         self.text_box = text_box
-        self.state = state
+        self.stop_event = stop_event
         self.noload = noload
+        self.signals = WorkerSignals()
         self.model = whisper.load_model("base")
         print("model loaded")
 
     def run(self):
         while True:
+            if self.stop_event.is_set():
+                break
             try:
                 data = self.buffer.get(block=True, timeout=1)
                 print("got buffer")
@@ -195,13 +171,14 @@ class TranscribeWorker(QRunnable):
                 self.text_box.append(result.text)
             except queue.Empty:
                 pass
+        self.signals.finished.emit()
 
 
 class SegmentWorker(QRunnable):
-    def __init__(self, buffer, state):
+    def __init__(self, buffer):
         super().__init__()
         self.buffer = buffer
-        self.state = state
+        self.signals = WorkerSignals()
 
     def run(self):
         duration = get_duration(DL_AUDIO_FILE)
@@ -218,6 +195,7 @@ class SegmentWorker(QRunnable):
             out, _ = ffmpeg.run(audio_output, capture_stdout=True, capture_stderr=True)
             self.buffer.put(out)
             ss += 25 - 0.2
+        self.signals.finished.emit()
             
 
 class ChatWorker(QRunnable):
@@ -255,6 +233,8 @@ class MyDialog(QDialog):
                       'transcribing': False,
                       'downloading': False,
                       'chatting': False}
+        self.event_stop_listen = threading.Event()
+        self.event_stop_transcribe = threading.Event()
         self.history = []
 
         layout = QVBoxLayout()
@@ -287,8 +267,8 @@ class MyDialog(QDialog):
         self.start_youtube_button = QPushButton("Download Audio")
         self.start_youtube_button.setVisible(False)
         self.start_youtube_button.pressed.connect(self.start_yt_download)
-        self.start_listen_button = QPushButton("Start Listening")
-        self.start_listen_button.pressed.connect(self.start_listening)
+        self.start_stop_listen_button = QPushButton("Start Listening")
+        self.start_stop_listen_button.pressed.connect(self.start_listening)
         self.stop_button = QPushButton("Stop")
         self.stop_button.setDisabled(True)
         self.stop_button.pressed.connect(self.stop_listening)
@@ -298,7 +278,7 @@ class MyDialog(QDialog):
         combo_box.addItems(["English", "Spanish", "French", "German", "Italian", "Portuguese", "Russian", "Chinese"])
         btn_layout.addWidget(combo_box)
         btn_layout.addItem(spacer1)
-        btn_layout.addWidget(self.start_listen_button)
+        btn_layout.addWidget(self.start_stop_listen_button)
         btn_layout.addWidget(self.start_youtube_button)
         btn_layout.addWidget(self.stop_button)
         btn_layout.addItem(spacer1)
@@ -306,13 +286,6 @@ class MyDialog(QDialog):
         clr_button.pressed.connect(self.clear_text)
         btn_layout.addWidget(clr_button)
         layout.addLayout(btn_layout)
-        # button_group2 = QButtonGroup()
-        # button_group2.addButton(self.start_youtube_button)
-        # button_group2.addButton(self.start_listen_button)
-        # button_group2.addButton(self.stop_button)
-        # layout.addWidget(self.start_listen_button)
-        # layout.addWidget(self.start_youtube_button)
-        # layout.addWidget(self.stop_button)
 
         # Create the text box
         self.text_box = QTextEdit()
@@ -379,18 +352,18 @@ class MyDialog(QDialog):
         if is_listen:
             self.url_edit.setEnabled(False)
             self.start_youtube_button.setVisible(False)
-            self.start_listen_button.setVisible(True)
+            self.start_stop_listen_button.setVisible(True)
             self.stop_button.setVisible(True)
+            self.event_stop_listen.set()
         else:
             self.url_edit.setEnabled(True)
             self.start_youtube_button.setVisible(True)
-            self.start_listen_button.setVisible(False)
+            self.start_stop_listen_button.setVisible(False)
             self.stop_button.setVisible(False)
 
     def start_yt_download(self):
         self.status_label.setText("Downloading youtube audio...")
-        worker = Worker(self.yt_download, self.url_edit.text(),
-                        finished='Download finished!')
+        worker = Worker(self.yt_download, self.url_edit.text())
         worker.signals.finished.connect(self.start_transcribe_yt)
         self.threadpool.start(worker)
 
@@ -405,12 +378,18 @@ class MyDialog(QDialog):
     def start_transcribe_yt(self):
         print("Starting transcribe YT")
         # self.state['downloading'] = True
-        self.segment_worker = SegmentWorker(self.buffer, self.state)
+        self.event_stop_transcribe.clear()
+        self.segment_worker = SegmentWorker(self.buffer)
+        self.segment_worker.signals.finished.connect(self.on_segmentation_finished)
         self.threadpool.start(self.segment_worker)
-        if not self.transcribe_worker:
-            self.transcribe_worker = TranscribeWorker(self.buffer, self.text_box, self.state, noload=True)
-            self.threadpool.start(self.transcribe_worker)
+        self.transcribe_worker = TranscribeWorker(self.buffer, self.text_box,
+                                                  self.event_stop_transcribe, noload=True)
+        self.threadpool.start(self.transcribe_worker)
         self.status_label.setText("Started transcription!")
+        
+    @Slot()
+    def on_segmentation_finished(self):
+        self.event_stop_transcribe.set()
 
     @Slot()
     def start_listening(self):
@@ -418,11 +397,30 @@ class MyDialog(QDialog):
         The listening thread will continuously run until user presses the stop button.
         The transcribe thread will continuously run until all audio has been transcribed.
         """
-        self.state['listening'] = True
-        self.listen_worker = ListeningWorker(self.buffer, self.state)
-        self.threadpool.start(self.listen_worker)
-        self.transcribe_worker = TranscribeWorker(self.buffer, self.text_box, self.state)
-        self.threadpool.start(self.transcribe_worker)
+        if not self.start_stop_listen_button.isEnabled():
+            return
+
+        if self.state['listening']:
+            self.event_stop_listen.set()
+            self.status_label.setText("Stop Listening requested")
+            self.start_stop_listen_button.setText("Please wait...")
+            self.start_stop_listen_button.setEnabled(False)
+            self.state['listening'] = False
+        else:
+            self.state['listening'] = True
+            self.event_stop_listen.clear()
+            self.event_stop_transcribe.clear()
+            self.start_stop_listen_button.setText("Stop Listening")
+            self.listen_worker = ListeningWorker(self.buffer, self.event_stop_listen)
+            self.listen_worker.signals.finished.connect(self.on_listening_stopped)
+            self.threadpool.start(self.listen_worker)
+            self.transcribe_worker = TranscribeWorker(self.buffer, self.text_box, self.event_stop_transcribe)
+            self.threadpool.start(self.transcribe_worker)
+            
+    @Slot()
+    def on_listening_stopped(self):
+        self.start_stop_listen_button.setText("Start Listening")
+        self.start_stop_listen_button.setEnabled(True)
 
     def send_chat(self, prompt):
         worker = Worker(self.process_chat, prompt, self.history)
@@ -468,3 +466,5 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     dialog = MyDialog()
     dialog.exec()
+    dialog.event_stop_listen.set()
+    dialog.event_stop_transcribe.set()
