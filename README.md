@@ -1,18 +1,20 @@
 # WhisperGLM
 
-This is a GUI interface for OpenAI Whisper and GhatGLM running locally.
+This is a GUI interface for [OpenAI Whisper](https://github.com/openai/whisper) and [GhatGLM](https://github.com/THUDM/ChatGLM-6B) running locally.
 
 This program can only run on Windows for now.
 
-With Whisper, it can listen to system audio and transribe speech to text.  It can also download youtube video and transcribe it to text.
+With Whisper, it can listen to system audio or microphone and transribe speech to text.
 
-Combined with ChatGLM, it can summerize the text, or answer the question in transcribed text, as well as chat with ChatGLM directly.
+It can also download youtube video and transcribe it to text.
+
+Combined with ChatGLM, it can summerize the text, as well as can be chatted with directly.
 
 ## Installation
 
 A NVIDIA GPU with >=8GB vram is required to run this program.
 
-**Option 1**: 
+~~**Option 1**~~: (not ready yet) 
 
 Download from Releases, unzip it, and run main.pyw.
 
@@ -29,7 +31,7 @@ Install rest of dependencies:
 
     pip install -r requirements.txt
 
-Download ChatGLM-6B model from Huggingface (you need to have [git-lfs](https://github.com/git-lfs/git-lfs#installing) already installed):
+**(Optional)** Download ChatGLM-6B model from Huggingface (you need to have [git-lfs](https://github.com/git-lfs/git-lfs#installing) already installed):
 
     cd data
     git clone https://huggingface.co/THUDM/chatglm-6b-int4
@@ -40,7 +42,13 @@ If you don't have git-lfs, you can check out without large file:
 
 Then go to: [here](https://huggingface.co/THUDM/chatglm-6b-int4/tree/main) and download `pytorch_model.bin` directly.
 
-After everything is setup, run main.py
+### After everything is setup, run main.py
 
     python main.py
+    
+If you skipped installing ChatGLM models, start the program without the model:
+
+    python main.py -n
+    
+    
 
