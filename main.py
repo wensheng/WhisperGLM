@@ -50,7 +50,8 @@ DL_AUDIO_FILE = os.path.join('data', 'temp.m4a')
 model, tokenizer = None, None
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--noglm', type=bool, default=False, help='will not load ChatGLM model')
+parser.add_argument('-n', '--noglm', default=False,
+                    action='store_true', help='will not load ChatGLM model')
 
 
 class WorkerSignals(QObject):
@@ -87,9 +88,10 @@ class Worker(QRunnable):
 
 class ListeningWorker(QRunnable):
     # data_ready = Signal(bytes)
-    def __init__(self, buffer, stop_event):
+    def __init__(self, buffer, device_info, stop_event):
         super().__init__()
         self.buffer = buffer
+        self.device_info = device_info
         self.stop_event = stop_event
         print("listening worker initialized")
         self.signals = WorkerSignals()
@@ -111,10 +113,10 @@ class ListeningWorker(QRunnable):
             wf.setframerate(44100)
 
             stream = p.open(format=pyaudio.paInt16,
-                            channels=2,
+                            channels=self.device_info[1],
                             rate=44100,
                             input=True,
-                            input_device_index=2,
+                            input_device_index=self.device_info[0],
                             frames_per_buffer=FRAMES_PER_BUFFER)
 
             # Record audio for the specified duration
@@ -274,9 +276,9 @@ class MyDialog(QDialog):
         self.stop_button.pressed.connect(self.stop_listening)
         btn_layout = QHBoxLayout()
         spacer1 = QSpacerItem(40, 20, QSizePolicy.Expanding, QSizePolicy.Minimum)
-        combo_box = QComboBox()
-        combo_box.addItems(["English", "Spanish", "French", "German", "Italian", "Portuguese", "Russian", "Chinese"])
-        btn_layout.addWidget(combo_box)
+        self.combo_box = QComboBox()
+        self.set_audio_device_selections()
+        btn_layout.addWidget(self.combo_box)
         btn_layout.addItem(spacer1)
         btn_layout.addWidget(self.start_stop_listen_button)
         btn_layout.addWidget(self.start_youtube_button)
@@ -332,11 +334,29 @@ class MyDialog(QDialog):
         # self.threads = {}
         self.threadpool = QThreadPool()
         print("Pool created with maximum %d threads" % self.threadpool.maxThreadCount())
+        
+    def set_audio_device_selections(self) -> None:
+        """
+        In my PC, I have 34 devices
+        We pick first 15 devices and select those that starts with "Microphone", "Stereo Mix"
+        """
+        p = pyaudio.PyAudio()
+        c = p.get_device_count()
+        n = 15 if c > 15 else c
+        for i in range(n):
+            dev = p.get_device_info_by_index(i)
+            if (dev['name'].startswith(('Microphone', 'Stereo Mix', 'Microsoft Sound Mapper',))
+                and dev['maxInputChannels'] > 0):
+                # Can not use tuple because of pyqt bug, had to use list
+                self.combo_box.addItem(dev['name'], [dev['index'], dev['maxInputChannels']])
+        p.terminate()
+        idx = self.combo_box.findData([2, 2])  # default to Stereo Mix
+        if idx:
+            self.combo_box.setCurrentIndex(idx)
 
     def eventFilter(self, obj, event):
         if obj is self.chat_box and event.type() == QEvent.KeyPress:
             if event.key() == Qt.Key_Return and self.chat_box.hasFocus():
-                print("enter pressed")
                 self.send_chat(self.chat_box.toPlainText())
                 self.text_box.append(f'Me: {self.chat_box.toPlainText()}\n')
                 self.chat_box.setText('')
@@ -411,7 +431,8 @@ class MyDialog(QDialog):
             self.event_stop_listen.clear()
             self.event_stop_transcribe.clear()
             self.start_stop_listen_button.setText("Stop Listening")
-            self.listen_worker = ListeningWorker(self.buffer, self.event_stop_listen)
+            device_info = self.combo_box.currentData()
+            self.listen_worker = ListeningWorker(self.buffer, device_info, self.event_stop_listen)
             self.listen_worker.signals.finished.connect(self.on_listening_stopped)
             self.threadpool.start(self.listen_worker)
             self.transcribe_worker = TranscribeWorker(self.buffer, self.text_box, self.event_stop_transcribe)
@@ -423,6 +444,7 @@ class MyDialog(QDialog):
         self.start_stop_listen_button.setEnabled(True)
 
     def send_chat(self, prompt):
+        # TODO: will use one long-running worker
         worker = Worker(self.process_chat, prompt, self.history)
         worker.signals.result.connect(self.handle_chat_res)
         self.threadpool.start(worker)
