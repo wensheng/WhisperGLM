@@ -6,7 +6,6 @@ import queue
 import argparse
 import threading
 from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor
 
 import ffmpeg
 import pythoncom
@@ -198,30 +197,6 @@ class SegmentWorker(QRunnable):
             self.buffer.put(out)
             ss += 25 - 0.2
         self.signals.finished.emit()
-            
-
-class ChatWorker(QRunnable):
-    def __init__(self, buffer, state):
-        super().__init__()
-        self.buffer = buffer
-        self.state = state
-        self.signals = WorkerSignals()
-
-    def run(self):
-        while True:
-            try:
-                data = self.buffer.get(block=True, timeout=1)
-                print("got buffer")
-                audio = load_audio(data, sr=16000)
-                audio = whisper.pad_or_trim(audio)
-                mel = whisper.log_mel_spectrogram(audio).to(self.model.device)
-                _, probs = self.model.detect_language(mel)
-                options = whisper.DecodingOptions()
-                result = whisper.decode(self.model, mel, options)
-                print(result.text)
-                self.text_box.append(result.text)
-            except queue.Empty:
-                pass
 
 
 class MyDialog(QDialog):
@@ -298,7 +273,8 @@ class MyDialog(QDialog):
 
         btn_layout2 = QHBoxLayout()
         chat_button = QPushButton("Chat")
-        #chat_button.pressed.connect(self.start_chat)
+        # TODO:
+        # chat_button.pressed.connect(self.start_chat_worker)
         btn_layout2.addWidget(chat_button)
         btn_layout2.addItem(spacer1)
         summary_button = QPushButton("Summarize")
@@ -312,7 +288,7 @@ class MyDialog(QDialog):
         self.summary_box.setFont(font)
         self.summary_box.setVisible(False)
         layout.addWidget(self.summary_box)
-        
+
         self.chat_box = QTextEdit()
         self.chat_box.setMaximumHeight(60)
         self.chat_box.setFont(font)
@@ -334,7 +310,7 @@ class MyDialog(QDialog):
         # self.threads = {}
         self.threadpool = QThreadPool()
         print("Pool created with maximum %d threads" % self.threadpool.maxThreadCount())
-        
+
     def set_audio_device_selections(self) -> None:
         """
         In my PC, I have 34 devices
@@ -346,7 +322,7 @@ class MyDialog(QDialog):
         for i in range(n):
             dev = p.get_device_info_by_index(i)
             if (dev['name'].startswith(('Microphone', 'Stereo Mix', 'Microsoft Sound Mapper',))
-                and dev['maxInputChannels'] > 0):
+                    and dev['maxInputChannels'] > 0):
                 # Can not use tuple because of pyqt bug, had to use list
                 self.combo_box.addItem(dev['name'], [dev['index'], dev['maxInputChannels']])
         p.terminate()
@@ -362,7 +338,7 @@ class MyDialog(QDialog):
                 self.chat_box.setText('')
                 return True
         return False
-    
+
     @Slot()
     def clear_text(self):
         self.text_box.setText('')
@@ -393,7 +369,7 @@ class MyDialog(QDialog):
         """
         yt_dlp._real_main(argv=[url, '--no-update', '--force-overwrites',
                           '-q', '-f', '139', '-o', DL_AUDIO_FILE]),
-        
+
     @Slot()
     def start_transcribe_yt(self):
         print("Starting transcribe YT")
@@ -406,7 +382,7 @@ class MyDialog(QDialog):
                                                   self.event_stop_transcribe, noload=True)
         self.threadpool.start(self.transcribe_worker)
         self.status_label.setText("Started transcription!")
-        
+
     @Slot()
     def on_segmentation_finished(self):
         self.event_stop_transcribe.set()
@@ -437,7 +413,7 @@ class MyDialog(QDialog):
             self.threadpool.start(self.listen_worker)
             self.transcribe_worker = TranscribeWorker(self.buffer, self.text_box, self.event_stop_transcribe)
             self.threadpool.start(self.transcribe_worker)
-            
+
     @Slot()
     def on_listening_stopped(self):
         self.start_stop_listen_button.setText("Start Listening")
@@ -448,7 +424,7 @@ class MyDialog(QDialog):
         worker = Worker(self.process_chat, prompt, self.history)
         worker.signals.result.connect(self.handle_chat_res)
         self.threadpool.start(worker)
-        
+
     @Slot()
     def handle_chat_res(self, res):
         self.history = res['history']
